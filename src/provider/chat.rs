@@ -16,6 +16,18 @@ pub async fn chat_completions(
 
 }
 
+
+
+// {
+//   "object": "list",
+//   "data": [
+//     {
+//       "id": "claude-sonnet-4",
+//       "object": "model",
+//       "owned_by": "yzz-llm-proxy"
+//     }
+//   ]
+// }
 pub async fn list_models(
     State(state): State<AppState>,
 ) -> Json<Value> {

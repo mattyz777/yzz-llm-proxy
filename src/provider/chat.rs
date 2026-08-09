@@ -4,8 +4,8 @@ use serde_json::Value;
 
 use crate::{
     provider::kiro,
-    state::{AppState, ProviderAuth},
-    types::ChatRequest,
+    state::{AppState, ProviderContext},
+    types::openai_request::ChatRequest,
 };
 
 /// POST /v1/chat/completions

@@ -7,7 +7,7 @@ use crate::constant::DEFAULT_CONFIG_CONTENT;
 
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct Config {
+pub struct AppConfig {
     pub server: ServerConfig,
     pub accounts: Option<Vec<AccountConfig>>,
 }
@@ -30,7 +30,7 @@ pub enum AccountConfig {
     },
 }
 
-impl Config {
+impl AppConfig {
     pub fn init() -> Result<Self> {
         let path = Self::get_config_path()?;
         if !path.exists() {
@@ -43,14 +43,14 @@ impl Config {
         }
         
         let content = std::fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let config: Self = toml::from_str(&content)?;
 
         Self::print_load_providers(&config);
 
         Ok(config)
     }
 
-    fn print_load_providers(config: &Config) -> String {
+    fn print_load_providers(config: &Self) -> String {
         let providers:String = match &config.accounts {
             Some(accounts) => {
                 accounts.iter().map(|account| {

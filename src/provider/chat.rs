@@ -1,6 +1,6 @@
 
 use axum::{Json, extract::State, http::StatusCode, response::Response};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     provider::kiro,
@@ -19,5 +19,16 @@ pub async fn chat_completions(
 pub async fn list_models(
     State(state): State<AppState>,
 ) -> Json<Value> {
-    
+    let models:Vec<Value>  = state.models.iter().map(|model| {
+        json!({
+            "id": model,
+            "object": "model",
+            "owned_by": "yzz-llm-proxy",
+        })
+    }).collect();
+
+    Json(json!({
+        "object": "list",
+        "data": models,
+    }))
 }

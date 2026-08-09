@@ -8,8 +8,8 @@ use crate::constant::DEFAULT_CONFIG_CONTENT;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
-    server: ServerConfig,
-    accounts: Option<Vec<AccountConfig>>,
+    pub server: ServerConfig,
+    pub accounts: Option<Vec<AccountConfig>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

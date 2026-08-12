@@ -1,49 +1,38 @@
-use std::sync::LazyLock;
+use std::sync::Arc;
 
-use axum::http::{HeaderMap, HeaderValue};
-use reqwest::header::USER_AGENT;
-use serde::Deserialize;
-use uuid::Uuid;
+use axum::{
+    http:: StatusCode,
+    response::{IntoResponse, Response},
+};
+use serde_json::Value;
+use tokio::sync::RwLock;
 
 use crate::{
-    provider::kiro::credential::KiroToken, 
-    types::kiro_response::ModelsResponse
+    provider::kiro::{client_helper::{get_kiro_headers, get_valid_token}, credential::KiroToken, request_builder::build_chat_payload, response_builder::{build_json_response, build_sse_stream}}, state::AppState, types::{kiro_response::ModelsResponse, openai_request::ChatRequest}
 };
 
 
-
-static MACHINE_ID: LazyLock<String> = LazyLock::new(|| {
-    let a = Uuid::new_v4().simple().to_string();
-    let b = Uuid::new_v4().simple().to_string();
-    format!("{a}{b}")
-});
-
-pub fn get_kiro_headers() -> HeaderMap {
-    /***
-    | UA(user-agent) part        | Source                     |
-    | -------------------------- | -------------------------- |
-    | aws-sdk-js/1.0.27          | AWS SDK                    |
-    | os/win32                   | Node os module             |
-    | md/nodejs#22.21.1          | Node runtime               |
-    | api/codewhispererstreaming | AWS client package         |
-    | KiroIDE-0.7.45             | Kiro application custom UA |
-     */
-    let ua = format!(
-        "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{}",
-        *MACHINE_ID
-    );
-    let x_amz_ua = format!(
-        "aws-sdk-js/1.0.27 KiroIDE-0.7.45-{}",
-        *MACHINE_ID
-    );
-
-    let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap());
-    headers.insert("x-amz-user-agent", HeaderValue::from_str(&x_amz_ua).unwrap());
-    headers.insert("content-type", HeaderValue::from_static("application/x-amz-json-1.0"));
-    headers
+pub async fn chat_kiro(
+    state: &AppState,
+    token: &Arc<RwLock<KiroToken>>,
+    profile_arn: &str,
+    region: &str,
+    request: &ChatRequest,
+    model: &str,
+) -> Result<Response, StatusCode> {
+    let access_token = get_valid_token(token, &state.http).await?;
+    let payload = build_chat_payload(request, model, profile_arn);
+    
+    tracing::debug!("Payload: {}", serde_json::to_string(&payload).unwrap());
+    
+    let resp = send_to_kiro(&state.http, &access_token, region, &payload).await?;
+    
+    if request.stream {
+        Ok(build_sse_stream(resp, request.model.clone()).into_response())
+    } else {
+        Ok(build_json_response(resp, request.model.clone()).await?.into_response())
+    }
 }
-
 
 pub async fn list_models(
     http: &reqwest::Client,
@@ -67,4 +56,39 @@ pub async fn list_models(
 
     let data: ModelsResponse = res.json().await?;
     Ok(data.models.into_iter().map(|m| m.model_id).collect())
+}
+
+
+
+async fn send_to_kiro(
+    http: &reqwest::Client,
+    access_token: &str,
+    region: &str,
+    payload: &Value,
+) -> Result<reqwest::Response, StatusCode> {
+    let url = format!(
+        "https://runtime.{}.kiro.dev/generateAssistantResponse",
+        region
+    );
+
+    let resp = http
+        .post(&url)
+        .headers(get_kiro_headers())
+        .bearer_auth(access_token)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Kiro request failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        tracing::error!("Kiro API error: {status} - {text}");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    Ok(resp)
 }

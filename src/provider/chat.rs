@@ -13,11 +13,36 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(request): Json<ChatRequest>,
 ) -> Result<Response, StatusCode> {
+    let (name, model) = request.model.split_once('/')
+        .ok_or_else(|| {
+            tracing::warn!("Model {} is not allowed.", request.model);
+            StatusCode::BAD_REQUEST
+        })?;
+    
+    let provider = state.providers.get(name)
+        .ok_or_else(|| {
+            tracing::warn!("Model {} is not allowed.", request.model);
+            StatusCode::NOT_FOUND
+        })?;
 
+    match provider {
+        ProviderContext::Kiro { token, profile_arn, region } => {
+            kiro::client::chat_kiro(&state, token, profile_arn, region, &request, model).await
+        },
+        ProviderContext::DashScope { .. } => {
+            // TODO: proxy to DashScope
+            Err(StatusCode::NOT_IMPLEMENTED)
+        },
+        ProviderContext::Agnes { .. } => {
+            // TODO: proxy to Agnes
+            Err(StatusCode::NOT_IMPLEMENTED)
+        },
+    }
 }
 
 
 
+// Output
 // {
 //   "object": "list",
 //   "data": [

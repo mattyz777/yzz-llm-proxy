@@ -90,7 +90,7 @@ claude --provider openai --model "kiro/glm-5"
 Point the client to:
 - **Base URL**: `http://127.0.0.1:8127/v1`
 - **API Key**: any non-empty string (the proxy handles auth internally)
-- **Model**: `kiro/<model-id>` (e.g. `kiro/cglm-5`)
+- **Model**: `kiro/<model-id>` (e.g. `kiro/glm-5`)
 
 ## API Endpoints
 

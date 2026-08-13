@@ -3,22 +3,36 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use uuid::Uuid;
 
-/// A. Response from Kiro (binary-framed stream, each line is an independent JSON object):
+/// Transforms Kiro's binary-framed stream into OpenAI-compatible responses.
 ///
-/// {"content": "Hello"}
-/// {"content": " world"}
-/// {"toolUse": {"name": "get_weather", "input": {"city": "Singapore"}, "toolUseId": "call_001"}}
-/// {"toolUse": {"name": "get_weather", "input": {"city": "Tokyo"}, "toolUseId": "call_002"}}
+/// A. Response from Kiro (AWS binary event stream, each frame contains one JSON object):
+///
+/// Content events:
+///   {"content": "Hello", "modelId": "glm-5"}
+///   {"content": " world", "modelId": "glm-5"}
+///
+/// Streaming tool call events (3 phases per tool call):
+///   {"name": "read", "toolUseId": "tooluse_xxx"}                          — start
+///   {"input": "{\"filePath\": \"src/", "name": "read", "toolUseId": "tooluse_xxx"}  — arg chunks
+///   {"input": "main.rs\"}", "name": "read", "toolUseId": "tooluse_xxx"}   — more arg chunks
+///   {"name": "read", "stop": true, "toolUseId": "tooluse_xxx"}            — complete
+///
+/// Metadata events (ignored):
+///   {"stopReason": "END_TURN"}
+///   {"stopReason": "TOOL_USE"}
+///   {"contextUsagePercentage": 6.3}
+///   {"unit": "credit", "unitPlural": "credits", "usage": 0.15}
 ///
 ///
 /// B. Transformed OpenAI-compatible SSE format (stream=true):
 ///
-/// data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1723190400,"model":"kiro/claude-sonnet-4","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}
-/// data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1723190400,"model":"kiro/claude-sonnet-4","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}
-/// data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1723190400,"model":"kiro/claude-sonnet-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_001","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Singapore\"}"}},{"index":1,"id":"call_002","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}}]},"finish_reason":null}]}
-/// data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1723190400,"model":"kiro/claude-sonnet-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+/// data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":...,"model":"kiro/glm-5","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}
+/// data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":...,"model":"kiro/glm-5","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}
+/// data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":...,"model":"kiro/glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"tooluse_xxx","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"src/main.rs\"}"}}]},"finish_reason":null}]}
+/// data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":...,"model":"kiro/glm-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
 /// data: [DONE]
 ///
 ///
@@ -28,21 +42,96 @@ use uuid::Uuid;
 ///   "id": "chatcmpl-xxx",
 ///   "object": "chat.completion",
 ///   "created": 1723190400,
-///   "model": "kiro/claude-sonnet-4",
+///   "model": "kiro/glm-5",
 ///   "choices": [{
 ///     "index": 0,
 ///     "message": {
 ///       "role": "assistant",
 ///       "content": "Hello world",
 ///       "tool_calls": [
-///         {"index": 0, "id": "call_001", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Singapore\"}"}},
-///         {"index": 1, "id": "call_002", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}}
+///         {"index": 0, "id": "tooluse_xxx", "type": "function", "function": {"name": "read", "arguments": "{\"filePath\":\"src/main.rs\"}"}}
 ///       ]
 ///     },
 ///     "finish_reason": "tool_calls"
 ///   }]
 /// }
 
+
+
+
+/// Accumulates streaming tool call fragments from Kiro.
+/// Kiro sends tool calls in 3 phases:(added space just for human readable)
+/// {"name":"skill",                                     "toolUseId":"tooluse_K3Yc"}
+/// {"name":"skill", "input":"{\"name\": \"grilling\"}", "toolUseId":"tooluse_K3Yc"}
+/// {"name":"skill", "stop":true,                        "toolUseId":"tooluse_K3Yc"}
+/// 
+/// -------------------- openai format
+/// {
+///   "choices": [{
+///     "delta": {
+///       "tool_calls": [{
+///         "id": "tooluse_K3Yc",
+///         "type": "function",
+///         "function": {
+///           "name": "skill",
+///           "arguments": "{\"name\": \"grilling\"}"
+///         }
+///       }]
+///     }
+///   }]
+/// }
+struct ToolCallAccumulator {
+    calls: HashMap<String, (String, String)>, // toolUseId -> (name, accumulated_input)
+}
+
+impl ToolCallAccumulator {
+    fn new() -> Self {
+        Self { calls: HashMap::new() }
+    }
+
+    /// Process a streaming event. Returns Some(completed tool call) when stop:true is received.
+    fn process(&mut self, parsed: &Value) -> Option<Value> {
+        let tool_use_id = parsed.get("toolUseId")?.as_str()?;
+        let name = parsed.get("name")?.as_str()?;
+
+        // Skip if this is a content event (has "content" key and "modelId" key)
+        if parsed.get("modelId").is_some() {
+            return None;
+        }
+
+        // Check if this is the stop signal
+        if parsed.get("stop").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // Tool call complete — remove from map and return finished tool call
+            let (tool_name, input_str) = self.calls.remove(tool_use_id)?;
+            let input: Value = serde_json::from_str(&input_str).unwrap_or(json!({}));
+
+            return Some(json!({
+                "index": 0, // placeholder, will be updated by caller
+                "id": tool_use_id,
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": serde_json::to_string(&input).unwrap_or_default()
+                }
+            }));
+        }
+
+        // Accumulate input fragments
+        if let Some(input_fragment) = parsed.get("input").and_then(|v| v.as_str()) {
+            self.calls
+                .entry(tool_use_id.to_string())
+                .and_modify(|(_, acc)| acc.push_str(input_fragment))
+                .or_insert_with(|| (name.to_string(), input_fragment.to_string()));
+        } else {
+            // First event (no input yet) — register the tool call
+            self.calls
+                .entry(tool_use_id.to_string())
+                .or_insert_with(|| (name.to_string(), String::new()));
+        }
+
+        None
+    }
+}
 
 
 
@@ -58,40 +147,15 @@ pub fn build_sse_stream(
         let mut byte_stream = resp.bytes_stream();
         let mut first_chunk = true;
         let mut tool_calls: Vec<Value> = Vec::new();
+        let mut tool_accumulator = ToolCallAccumulator::new();
 
-        // Raw stream arrives in chunks:
+        // Raw stream arrives in binary-framed chunks. Each frame has a header
+        // ending with the literal "event" followed by the JSON payload.
         //
-        // Chunk 1: b"\x00\x05\x0a{"content":"Hel"
-        // Chunk 2: b"lo"}\x00\x03\x0b{"content":" wor"
-        // Chunk 3: b"ld"}\x00\x02"
+        // Example chunk: b"\x00\x00\x00\x89...:message-type\x07\x00\x05event{\"content\":\"Hello\"}\x27\x76..."
         //
-        // ─── Chunk 1 received ───
-        // buffer: "\x00\x05\x0a{"content":"Hel"
-        //          ↑ find('{') at pos=3
-        //          find_matching_brace → None (no closing })
-        //          break, wait for next chunk
-        //
-        // ─── Chunk 2 received (appended) ───
-        // buffer: "\x00\x05\x0a{"content":"Hello"}\x00\x03\x0b{"content":" wor"
-        //          ↑ find('{') at pos=3
-        //          find_matching_brace → Some(21)
-        //          extract: {"content":"Hello"}  ✓ valid JSON → emit SSE
-        //          buffer becomes: "\x00\x03\x0b{"content":" wor"
-        //
-        //          ↑ find('{') at pos=3
-        //          find_matching_brace → None (incomplete)
-        //          break, wait for next chunk
-        //
-        // ─── Chunk 3 received (appended) ───
-        // buffer: "\x00\x03\x0b{"content":" world"}\x00\x02"
-        //          ↑ find('{') at pos=3
-        //          find_matching_brace → Some(22)
-        //          extract: {"content":" world"}  ✓ valid JSON → emit SSE
-        //          buffer becomes: "\x00\x02"
-        //
-        //          find('{') → None
-        //          loop ends
-        //
+        // The parser searches for "event{" to locate the start of each JSON object,
+        // then uses find_matching_brace to extract the complete object.
         while let Some(chunk_result) = byte_stream.next().await {
             let chunk:Bytes = match chunk_result {
                 Ok(c) => c,
@@ -124,7 +188,8 @@ pub fn build_sse_stream(
                     yield Ok::<_, std::convert::Infallible>(event);
                 }
 
-                if let Some(tool_call) = extract_tool_use_event(&parsed, tool_calls.len()) {
+                if let Some(mut tool_call) = tool_accumulator.process(&parsed) {
+                    tool_call["index"] = json!(tool_calls.len());
                     tool_calls.push(tool_call);
                 }
             }
@@ -213,33 +278,14 @@ fn find_matching_brace(text: &str, start: usize) -> Option<usize> {
 
 
 
-/// Transforms Kiro's binary-framed stream into OpenAI-compatible responses.
+/// Converts a parsed Kiro content event into an OpenAI SSE Event.
 ///
-/// Data flow through three layers:
-///
-/// 1. Network layer (raw TCP chunks):
-///    Kiro sends raw bytes where a single JSON event may be split across
-///    multiple chunks, or multiple events may arrive in one chunk.
-///    e.g. b"\x00\x05\x0a{\"content\":\"Hel"  (incomplete)
-///
-/// 2. Logical event layer (complete JSON objects):
-///    The sliding window buffer assembles raw bytes into complete, independent
-///    JSON objects. Each object is one semantic event from Kiro.
-///    e.g. {"content": "Hello"}  or  {"toolUse": {...}}
-///
-/// 3. OpenAI output layer (SSE "chunks"):
-///    Each logical event is wrapped into a complete OpenAI `chat.completion.chunk`
-///    JSON message and emitted as an SSE `data:` line. Despite the name "chunk",
-///    each one is a fully valid JSON object — it's called a "chunk" because it
-///    represents one piece of the overall assistant response, not because it's
-///    incomplete data.
-/// 
-/// Input:  a parsed JSON value containing {"content": "Hello"}
-/// Output: 
+/// Input:  a parsed JSON value containing {"content": "Hello", "modelId": "glm-5"}
+/// Output: an axum SSE Event with data:
 ///         {"id":"...","object":"chat.completion.chunk","created":...,"model":"...","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
 ///
 /// On the first invocation, "role":"assistant" is included in the delta.
-/// 
+/// Returns None if content is empty or "content" key is absent.
 fn handle_content_event(
     parsed: &Value,
     first_chunk: &mut bool,
@@ -271,40 +317,6 @@ fn handle_content_event(
     Some(Event::default().data(data))
 }
 
-
-
-/// Extracts a Kiro tool use event and reshapes it into OpenAI tool_call format.
-///
-/// Input:  a parsed JSON value containing {"toolUse": {"name": "query_db", "input": {...}, "toolUseId": "call_001"}}
-/// Output: Some({"index": 0, "id": "call_001", "type": "function", "function": {"name": "query_db", "arguments": "{...}"}})
-///
-fn extract_tool_use_event(parsed: &Value, index: usize) -> Option<Value> {
-    //  Returns None if toolUse node doesn't exist or json missing critical fields.
-    let tool_use = parsed.get("toolUse")?;
-    let name = tool_use.get("name")?.as_str().unwrap_or("");
-    let input = tool_use.get("input").cloned().unwrap_or(json!({}));
-
-    let tool_use_id = tool_use.get("toolUseId")
-        .and_then(|id| id.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let id = if tool_use_id.is_empty() {
-        format!("call_{}", Uuid::new_v4().simple())
-    } else {
-        tool_use_id
-    };
-
-    Some(json!({
-        "index": index,
-        "id": id,
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": serde_json::to_string(&input).unwrap_or_default()
-        }
-    }))
-}
 
 
 /// Output 
@@ -367,6 +379,7 @@ pub async fn build_json_response(
     let mut byte_stream = resp.bytes_stream();
     let mut full_content = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    let mut tool_accumulator = ToolCallAccumulator::new();
 
     while let Some(chunk_result) = byte_stream.next().await {
         let chunk: Bytes = match chunk_result {
@@ -397,7 +410,8 @@ pub async fn build_json_response(
                 full_content.push_str(content);
             }
 
-            if let Some(tool_call) = extract_tool_use_event(&parsed, tool_calls.len()) {
+            if let Some(mut tool_call) = tool_accumulator.process(&parsed) {
+                tool_call["index"] = json!(tool_calls.len());
                 tool_calls.push(tool_call);
             }
         }

@@ -8,7 +8,7 @@ pub fn init_tracing() -> WorkerGuard {
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,tower_http=debug".into());
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| "debug,tower_http=debug".into());
 
     tracing_subscriber::registry()
         .with(env_filter)

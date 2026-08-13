@@ -102,14 +102,17 @@ pub fn build_sse_stream(
             };
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
+            tracing::debug!("Raw chunk ({} bytes): {:?}", chunk.len(), String::from_utf8_lossy(&chunk[..chunk.len().min(200)]));
 
-            while let Some(pos) = buffer.find('{') {
+            while let Some(pos) = buffer.find("event{").map(|p| p + 5) {
                 let end = match find_matching_brace(&buffer, pos) {
                     Some(e) => e,
                     None => break,
                 };
 
                 let json_str = buffer[pos..=end].to_string();
+                tracing::debug!("Extracted JSON: {}", &json_str[..json_str.len().min(200)]);
+
                 buffer = buffer[end + 1..].to_string();
 
                 let parsed: Value = match serde_json::from_str(&json_str) {
@@ -311,7 +314,7 @@ fn extract_tool_use_event(parsed: &Value, index: usize) -> Option<Value> {
 ///   "created":...,
 ///   "model":"...",
 ///   "choices":[
-///     { "index":0,"delta":{"tool_calls":[...]},"finish_reason":null }
+///     { "index":0, "delta":{ "tool_calls" : [...] }, "finish_reason":null }
 ///   ]
 /// }
 ///
@@ -376,7 +379,7 @@ pub async fn build_json_response(
 
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        while let Some(pos) = buffer.find('{') {
+        while let Some(pos) = buffer.find("event{").map(|p| p + 5) {
             let end = match find_matching_brace(&buffer, pos) {
                 Some(e) => e,
                 None => break,

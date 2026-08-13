@@ -77,26 +77,15 @@ impl AppConfig {
         providers
     }
 
+    // win  %USERPROFILE%\.config\yzz-llm-proxy\config.toml
+    // mac  ~/.config/yzz-llm-proxy/config.toml
     fn get_config_path() -> Result<PathBuf> {
-        #[cfg(target_os = "windows")]
-        {
-            dirs::data_dir() // %APPDATA%\Roaming
-                .map(|d| d.join(".yzz-llm-proxy").join("config.toml"))
-                .ok_or_else(||{
-                    tracing::error!("cannot determine windows data directory");
-                    anyhow!("cannot determine windows data directory")
-                })
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            dirs::home_dir() // ~
-                .map(|d| d.join(".yzz-llm-proxy").join("config.toml"))
-                .ok_or_else(||{
-                    tracing::error!("cannot determine home directory");
-                    anyhow!("cannot determine home directory")
-                })
-        }
+        dirs::home_dir()
+            .map(|d| d.join(".config").join("yzz-llm-proxy").join("config.toml"))
+            .ok_or_else(|| {
+                tracing::error!("cannot determine home directory");
+                anyhow!("cannot determine home directory")
+            })
     }
 
     fn create_default(path: &PathBuf) -> Result<()> {

@@ -20,13 +20,16 @@ pub async fn chat_kiro(
     request: &ChatRequest,
     model: &str,
 ) -> Result<Response, StatusCode> {
+    tracing::info!("chat_kiro called: model={}, stream={}", request.model, request.stream);
     let access_token = get_valid_token(token, &state.http).await?;
     let payload = build_chat_payload(request, model, profile_arn);
     
     tracing::debug!("Payload: {}", serde_json::to_string(&payload).unwrap());
     
+    tracing::info!("Sending to Kiro...");
     let resp = send_to_kiro(&state.http, &access_token, region, &payload).await?;
-    
+    tracing::info!("Kiro responded: status={}", resp.status());
+
     if request.stream {
         Ok(build_sse_stream(resp, request.model.clone()).into_response())
     } else {
@@ -40,7 +43,7 @@ pub async fn list_models(
     profile_arn: &str,
 ) -> anyhow::Result<Vec<String>> {
     let url = format!("https://q.{}.amazonaws.com/ListAvailableModels", token.region);
-
+    
     let res = http
         .get(&url)
         .headers(get_kiro_headers())
@@ -76,6 +79,7 @@ async fn send_to_kiro(
         .headers(get_kiro_headers())
         .bearer_auth(access_token)
         .json(payload)
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| {

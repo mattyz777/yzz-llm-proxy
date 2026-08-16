@@ -79,7 +79,7 @@ async fn send_to_kiro(
         .headers(get_kiro_headers())
         .bearer_auth(access_token)
         .json(payload)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(36000)) // 10hours
         .send()
         .await
         .map_err(|e| {
